@@ -273,3 +273,63 @@ def stock_view(items, stock):
     t["Aged Qty"] = t[AGED].sum(axis=1)
     t["Aged Value (Rs)"] = t["Aged Qty"] * t["Unit Cost (Rs)"]
     return t.sort_values("Aged Value (Rs)", ascending=False)
+
+
+def file_checks(name, df):
+    """Data checks that need only ONE sheet, so a single uploaded file still gets a data-quality report."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    out = []
+    add = lambda sev, p, h: out.append({"Severity": sev, "Sheet": name, "Problem": p, "How handled": h})
+    if "SKU" in df.columns:
+        sku = df["SKU"].astype(str)
+        bad = int((sku != sku.str.strip().str.upper()).sum())
+        if bad:
+            add("Fixed", f"{bad} SKU values in lower case and/or with trailing spaces", "Trimmed and upper-cased")
+    if name == "Item_Master":
+        d = int(df["SKU"].astype(str).str.strip().str.upper().duplicated().sum())
+        if d:
+            add("Fixed", f"{d} duplicate SKU rows", "First row kept")
+        flag = df.get("Alternate Flag", pd.Series("", index=df.index)).fillna("").astype(str).str.upper().str.strip()
+        alt = df.get("Alternate Item (name)", pd.Series(index=df.index, dtype=object))
+        for s in df.loc[alt.notna() & (flag == ""), "SKU"]:
+            add("Warning", f"{s} names an alternate item but has no flag", "Not merged (R1 needs SWITCH). Ask product team")
+        for s, f in zip(df.loc[~flag.isin(["", "SWITCH"]), "SKU"], flag[~flag.isin(["", "SWITCH"])]):
+            add("Warning", f"{s} has undefined flag '{f}'", "Treated as a normal item. Ask supply chain what it means")
+        dn = int(df["Item Name"].astype(str).str.contains(r"\s{2,}").sum() + alt.dropna().astype(str).str.contains(r"\s{2,}").sum())
+        if dn:
+            add("Fixed", f"{dn} names contain double spaces (alternates are matched by name)", "Names normalised before matching")
+        n_in = int((df["Status"].astype(str).str.strip().str.title() != "Active").sum())
+        if n_in:
+            add("Info", f"{n_in} inactive item(s): {', '.join(df.loc[df['Status'].astype(str).str.strip().str.title() != 'Active', 'SKU'])}", "Left out of the analysis (R2)")
+        for c in ("Master Pack Qty", "Unit Cost (Rs)"):
+            m = int((pd.to_numeric(df[c], errors="coerce").fillna(0) <= 0).sum())
+            if m:
+                add("Warning", f"{m} items with missing or zero {c}", "Check at source")
+    elif name == "Stock_Aging":
+        if df["SKU"].astype(str).str.strip().str.upper().duplicated().any():
+            add("Fixed", "Duplicate SKU rows", "Quantities summed")
+        for b in BUCKETS:
+            for _, r in df[df[b] < 0].iterrows():
+                add("Fixed", f"{r['SKU']} has negative stock ({int(r[b])}) in '{b}'", "Set to 0. Warehouse to correct at source")
+    elif name == "Sales_Lines":
+        m = df["Month"].map(parse_month)
+        odd = int(df["Month"].astype(str).str.match(r"^\d{4}-\d{2}").sum())
+        if odd:
+            add("Fixed", f"{odd} rows have month as '2026-06' (Excel converted text to a date)", "Both formats parsed")
+        if m.isna().any():
+            add("Warning", f"{int(m.isna().sum())} rows have an unreadable month", "Check at source")
+        key = pd.DataFrame({"m": m, "c": df["CustomerID"], "s": df["SKU"].astype(str).str.strip().str.upper(), "q": df["Qty"], "v": df["Value (Rs)"]})
+        dup = key.duplicated()
+        if dup.any():
+            add("Fixed", f"{int(dup.sum())} exact duplicate lines worth Rs {df.loc[dup, 'Value (Rs)'].sum():,.0f}", "Removed. Confirm they are not real repeat orders")
+        if (df["Qty"] <= 0).any():
+            add("Fixed", f"{int((df['Qty'] <= 0).sum())} lines with zero/negative quantity", "Removed")
+        if m.nunique() != MONTHS:
+            add("Warning", f"Sales cover {m.nunique()} months, not {MONTHS}", "Check the full period was exported")
+    elif name == "Customers":
+        if df["CustomerID"].duplicated().any():
+            add("Fixed", "Duplicate customer IDs", "First kept")
+        if df["Industry"].isna().any():
+            add("Warning", f"Industry missing for {list(df.loc[df['Industry'].isna(), 'CustomerID'])}", "Excluded from the 'similar business' bucket")
+    return out
