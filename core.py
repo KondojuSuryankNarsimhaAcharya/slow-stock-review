@@ -119,10 +119,17 @@ def clean(items, stock, sales, custs):
     return items, stock, sales, custs, log
 
 
-def run(items, stock, sales, custs):
+def run(items, stock, sales, custs=None):
+    derived = custs is None
+    if derived:  # Customers sheet not uploaded: build it from the sales lines
+        custs = sales.copy()
+        custs["CustomerID"] = custs["CustomerID"].astype(str).str.strip()
+        custs = custs.drop_duplicates("CustomerID")[["CustomerID", "CustomerName", "Industry"]].assign(Area="-")
     items, stock, sales, custs = [d.copy() for d in (items, stock, sales, custs)]
     items, stock, sales, custs, log = clean(items, stock, sales, custs)
     add = lambda sev, sh, p, h: log.append({"Severity": sev, "Sheet": sh, "Problem": p, "How handled": h})
+    if derived:
+        add("Warning", "Customers", "Customers sheet not uploaded", "Customer name and industry taken from the sales lines; area is not available")
     # R1 map old SKU -> alternate SKU
     byname = {norm(n): s for s, n in zip(items["SKU"], items["Item Name"])}
     status = dict(zip(items["SKU"], items["Status"]))
@@ -221,3 +228,48 @@ def load_workbook_sheets(src):
     if miss:
         raise ValueError(f"Missing sheets: {miss}")
     return [x[n] for n in need]
+
+
+SHEETS = ["Item_Master", "Stock_Aging", "Sales_Lines", "Customers"]
+
+
+def detect(df):
+    """Identify which of the 4 sheets a table is, from its column names (not the file name)."""
+    cols = {norm(c) for c in df.columns}
+    if {"master pack qty", "unit cost (rs)"} <= cols:
+        return "Item_Master"
+    if any(c.startswith("qty 0-30") for c in cols):
+        return "Stock_Aging"
+    if {"month", "sku", "qty", "value (rs)"} <= cols:
+        return "Sales_Lines"
+    if {"customerid", "area"} <= cols and "sku" not in cols:
+        return "Customers"
+    return None
+
+
+def read_any(f):
+    """Read an uploaded .xlsx (every sheet) or .csv and return {sheet_name: DataFrame} for the sheets recognised."""
+    name = f if isinstance(f, str) else f.name  # a path (sample data) or an uploaded file
+    d = {name: pd.read_csv(f)} if name.lower().endswith(".csv") else pd.read_excel(f, sheet_name=None)
+    out = {}
+    for df in d.values():
+        t = detect(df)
+        if t:
+            out[t] = df
+    return out
+
+
+def stock_view(items, stock):
+    """Partial result when no sales were uploaded: aged stock only (no classification possible)."""
+    items, stock = items.copy(), stock.copy()
+    for d in (items, stock):
+        d.columns = [str(c).strip() for c in d.columns]
+        d["SKU"] = d["SKU"].astype(str).str.strip().str.upper()
+    stock = stock.groupby("SKU", as_index=False)[BUCKETS].sum()
+    stock[BUCKETS] = stock[BUCKETS].clip(lower=0)
+    t = items.merge(stock, on="SKU", how="left").fillna({b: 0 for b in BUCKETS})
+    t = t[t["Status"].astype(str).str.strip().str.title() == "Active"].copy()
+    t["Total Stock"] = t[BUCKETS].sum(axis=1)
+    t["Aged Qty"] = t[AGED].sum(axis=1)
+    t["Aged Value (Rs)"] = t["Aged Qty"] * t["Unit Cost (Rs)"]
+    return t.sort_values("Aged Value (Rs)", ascending=False)
